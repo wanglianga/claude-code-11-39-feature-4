@@ -19,14 +19,17 @@ from sqlalchemy import select, text
 from app import models as m
 from app.config import settings
 from app.db import SessionLocal, ensure_database, init_db
-from app.schemas import IntakeLine, IntakeRequest
+from app.schemas import CoverageProofRequest, IntakeLine, IntakeRequest
 from app.services import balance, facts, ledgers, resolver
 from app.services.intake import ingest_document
+from app.services.timeliness import build_run
 from app.util import key_hash
 
 T0 = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
 EXPORT_DATE = datetime(2026, 9, 5, 10, 0, tzinfo=timezone.utc)
 VALUE_DATE = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+ANALYSIS_CUTOFF = datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc)
+BANK_ACCOUNT_USD = "ACCT-ENT-A-USD"
 DECL = "DECL-2026-100"
 INV = "INV-2026-001"
 
@@ -249,8 +252,57 @@ def seed(reset: bool = False) -> None:
         run = facts.compile_facts(db, entity_id=ents["ENT-A"].id, actor="seed")
         db.commit()
 
+        # ---- timeliness side-car: bank coverage calendar + one demo analysis run ----
+        # Coverage proofs (one extraction batch per month) span the whole post-approval window
+        # so every seeded export line gets a verifiable observation boundary.
+        from app.services.timeliness import coverage as coverage_service
+
+        coverage_dates = [
+            # coverage on the approval day is allowed; the strict "boundary after approval"
+            # rule is enforced separately (horizon <= approved_at is treated as uncovered)
+            datetime(2026, 9, 1, tzinfo=timezone.utc),
+            datetime(2026, 9, 30, tzinfo=timezone.utc),
+            datetime(2026, 10, 31, tzinfo=timezone.utc),
+            datetime(2026, 11, 30, tzinfo=timezone.utc),
+            datetime(2026, 12, 31, tzinfo=timezone.utc),
+        ]
+        for idx, day in enumerate(coverage_dates, start=1):
+            coverage_service.register_coverage_proof(
+                db,
+                CoverageProofRequest(
+                    entity_code="ENT-A",
+                    bank_account=BANK_ACCOUNT_USD,
+                    currency="USD",
+                    coverage_date=day,
+                    status="covered",
+                    completion=Decimal("1.0000"),
+                    extraction_batch_no=f"EX-2026-{idx:02d}",
+                    issued_at=day,
+                    received_at=day,
+                    sequence_no=idx,
+                    note="seeded monthly bank extraction coverage proof",
+                ),
+                ents["ENT-A"],
+            )
+        db.commit()
+        timeliness_run = build_run(
+            db,
+            entity_id=ents["ENT-A"].id,
+            actor="seed",
+            cutoff=ANALYSIS_CUTOFF,
+            group_filter={"review_batch_nos": [], "currencies": [], "export_line_ids": []},
+            mature_horizon_days=30,
+        )
+        db.commit()
+
         print("seeded: entities=%d users=%d export_lines=%d facts=%d unallocated=%d differences=%d"
               % (len(ents), len(USERS), len(exports), run.facts_count, run.unallocated_count, run.differences_count))
+        print("timeliness: run_id=%d sample_counts=%s tier_counts=%s"
+              % (
+                  timeliness_run.id,
+                  timeliness_run.result.get("sample_counts"),
+                  timeliness_run.result.get("tier_counts"),
+              ))
         print()
         print("API keys (X-API-Key):")
         for name, role, key, codes in USERS:

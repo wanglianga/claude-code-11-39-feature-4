@@ -512,3 +512,179 @@ class AuditLog(Base):
     object_id: Mapped[int | None] = mapped_column(BigInteger)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+# --------------------------------------------------------------------------------------
+# Timeliness & status-credibility analysis (read-mostly analytics side-car)
+#
+# These tables never feed back into the operational ledgers: the analysis service only
+# publishes ageing facts and data-quality certificates. It never predicts cash, allocates
+# bank transactions or closes declaration lines.
+# --------------------------------------------------------------------------------------
+
+class TimelinessEventRecord(Base):
+    """状态事件册 — append-only evidence registry used by the timeliness service.
+
+    Holds the four evidence families the spec requires (tax receipts, revocation notices,
+    bank data coverage proofs, extraction batches) with issued/received timestamps,
+    verifiable sequence numbers, hashes and source status. Tax receipt rows are synced from
+    the main task's intake ledger; revocation notices and coverage/extraction evidence are
+    registered directly here.
+    """
+
+    __tablename__ = "timeliness_event_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), nullable=False, index=True)
+    record_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    # tax_receipt | revocation_notice | bank_coverage_proof | extraction_batch
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    export_line_id: Mapped[int | None] = mapped_column(ForeignKey("export_lines.id"), index=True)
+    bank_account: Mapped[str | None] = mapped_column(String(64), index=True)
+    currency: Mapped[str | None] = mapped_column(String(3))
+    batch_no: Mapped[str | None] = mapped_column(String(128), index=True)
+    declaration_no: Mapped[str | None] = mapped_column(String(64), index=True)
+    # tax verdict vocabulary; null for non-tax evidence
+    review_status: Mapped[str | None] = mapped_column(String(32))
+    # valid | superseded | conflicted | revoked | withdrawn
+    source_status: Mapped[str] = mapped_column(String(24), nullable=False, default="valid")
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sequence_no: Mapped[int | None] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # revocation linkage: which approval event/batch it points at and how it takes effect
+    target_ref: Mapped[str | None] = mapped_column(String(128))
+    target_export_line_id: Mapped[int | None] = mapped_column(BigInteger)
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retroactive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # issued before an observation cutoff but received after it
+    late_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("record_kind", "sha256", name="uq_timeliness_event_hash"),
+        Index("ix_timeliness_event_line_kind", "export_line_id", "record_kind"),
+    )
+
+
+class BankCoverageEntry(Base):
+    """覆盖日历 — bank data coverage per account / currency / date.
+
+    Rows are versioned, never deleted: a corrected extraction that reduces coverage inserts
+    replacement rows and supersedes the old ones. Historical analysis runs keep their own
+    snapshot; new runs only ever read is_current=True rows.
+    """
+
+    __tablename__ = "bank_coverage_calendar"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), nullable=False, index=True)
+    bank_account: Mapped[str] = mapped_column(String(64), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    coverage_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # covered | partial | uncovered
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    completion: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=Decimal("1.0000"))
+    extraction_batch_no: Mapped[str | None] = mapped_column(String(128), index=True)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # valid | superseded | withdrawn
+    source_status: Mapped[str] = mapped_column(String(24), nullable=False, default="valid")
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    superseded_by_id: Mapped[int | None] = mapped_column(ForeignKey("bank_coverage_calendar.id"))
+    corrected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sequence_no: Mapped[int | None] = mapped_column(Integer)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bank_account",
+            "currency",
+            "coverage_date",
+            "extraction_batch_no",
+            name="uq_coverage_calendar_slot",
+        ),
+        Index("ix_coverage_lookup", "entity_id", "currency", "coverage_date", "is_current"),
+    )
+
+
+class TimelinessRun(Base):
+    """时效分析运行 — immutable, versioned snapshot. Late evidence never rewrites an old run;
+    it triggers a new run whose boundary and input fingerprint are recorded explicitly."""
+
+    __tablename__ = "timeliness_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int | None] = mapped_column(ForeignKey("entities.id"), index=True)
+    run_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    observation_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    group_filter: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    mature_horizon_days: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="completed")
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class TimelinessLineFinding(Base):
+    """行级时效事实与可信度证书 — one row per export line per analysis run."""
+
+    __tablename__ = "timeliness_line_findings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("timeliness_runs.id"), nullable=False, index=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), nullable=False, index=True)
+    export_line_id: Mapped[int] = mapped_column(ForeignKey("export_lines.id"), nullable=False, index=True)
+    review_batch_no: Mapped[str | None] = mapped_column(String(128))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # analyzable | restricted | data_pending | event_conflict
+    credibility_tier: Mapped[str] = mapped_column(String(24), nullable=False)
+    # first_complete | full_complete | unfinished_censored | excluded_not_sampled
+    sample_classification: Mapped[str] = mapped_column(String(32), nullable=False)
+    in_first_receipt_sample: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    in_full_receipt_sample: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    first_receipt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_receipt_days: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    full_receipt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    full_receipt_days: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    waiting_days: Mapped[Decimal | None] = mapped_column(Numeric(14, 4))
+    observation_boundary_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    boundary_basis: Mapped[str | None] = mapped_column(String(64))
+    # 到账证据存在、行级归属待完成 (pending-allocation txn with an auditable candidate basis)
+    pending_evidence_exists: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    bank_uncovered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    revocation_status: Mapped[str | None] = mapped_column(String(32))
+    same_day_ambiguity: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    limit_reasons: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (UniqueConstraint("run_id", "export_line_id", name="uq_timeliness_run_line"),)
+
+
+class TimelinessSurvivalPoint(Base):
+    """右删失风险集推导结果 — one row per event time point, metric and stratum."""
+
+    __tablename__ = "timeliness_survival_points"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("timeliness_runs.id"), nullable=False, index=True)
+    # first_receipt | full_receipt
+    metric: Mapped[str] = mapped_column(String(24), nullable=False)
+    entity_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    review_batch_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    t_days: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    n_risk: Mapped[int] = mapped_column(Integer, nullable=False)
+    d_events: Mapped[int] = mapped_column(Integer, nullable=False)
+    c_censored: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    survival: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    ci_lower: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    ci_upper: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    cumulative_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_survival_run_metric", "run_id", "metric", "entity_code", "currency", "review_batch_no"),
+    )

@@ -9,7 +9,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 
 from .config import settings
 from .db import init_db
-from .routers import admin, intake, reconciliation
+from .routers import admin, intake, reconciliation, timeliness
 
 
 @asynccontextmanager
@@ -39,6 +39,17 @@ DESCRIPTION = """
 - 海关更正建立修订链，已提交行转为更正待处理，旧审核记录仍可回查。
 - 税务回执乱序时按签发时间与可验证序号转换；无法证明顺序时进入回执冲突。
 - 已确认关联进入复审时，新编译不把它计入已证实到账量，占用金额冻结。
+
+退税审核到账时效与状态可信度分析（只读分析，不回写业务账）
+- 状态事件册保存税务回执、撤销通知、银行覆盖证明与提取批次的签发/接收时间、序号、哈希与来源状态。
+- 事件排序器按签发时间、可验证序号与撤销关系重建审核事件序列；迟到事件只标记不回写历史运行；
+  序号冲突且来源权威性不可判定时冻结结论，不生成时长。
+- 覆盖日历按账户/币种/日期标记 covered/partial/uncovered；批准日晚于覆盖末日的行标为银行未覆盖，
+  不计等待也不计到账延迟；提取批次更正缩减覆盖时，历史运行保留原版本。
+- 时效样本三分：首次到账完成、足额到账完成、未完成观察（右删失，单独分布，绝不混入完成样本）；
+  待分摊流水只有在主任务提供行级候选关联依据时才标为到账证据存在、行级归属待完成。
+- 按主体×币种×审核批次分别构建首次/足额风险集做 Kaplan–Meier 右删失分析，成熟历史批次保留
+  同口径比例参照；无完成事件不发布中位时长，全未到账不产生零天结果。
 """
 
 app = FastAPI(
@@ -53,6 +64,7 @@ app = FastAPI(
 app.include_router(admin.router)
 app.include_router(intake.router)
 app.include_router(reconciliation.router)
+app.include_router(timeliness.router)
 
 
 @app.get("/health", tags=["meta"])
